@@ -161,6 +161,27 @@ Sau 6 phase nền, dự án được nâng lên mức production:
 - **Deploy**: `Dockerfile` (chạy user `node`, không nướng secret), `docker-compose.yml`
   (server + redis), `.dockerignore` loại `.env`, GitHub Actions CI (`.github/workflows/ci.yml`).
 
+### Tích hợp agent-guard (defense-in-depth, 2 lớp guard)
+
+Server `/chat` hỗ trợ sidecar **[agent-guard](https://github.com/teohumble1/agent-guard)**
+(Python, cùng tác giả) làm lớp phòng thủ thứ hai, độc lập tiến trình với
+`guard.ts` in-process:
+
+```bash
+# terminal 1 — sidecar (repo agent-guard)
+python -m agent_guard.server --port 8788
+# terminal 2 — server với sidecar bật
+AGENT_GUARD_URL=http://127.0.0.1:8788 pnpm --filter @voxagent/server dev
+```
+
+- Mỗi message tới `/chat` được POST sang sidecar `/evaluate` trước khi chạm
+  vào agent; bị chặn thì client nhận event SSE `blocked` kèm mã rule
+  (vd `[PI001, PI010]`) làm bằng chứng.
+- **Fail-closed**: đã bật sidecar mà nó không phản hồi → request bị chặn,
+  guard "đang bật" không được lặng lẽ biến mất. Có test riêng
+  (`guardGateway.test.ts`, 5 test với mock sidecar).
+- Mọi quyết định (kể cả allow) được sidecar ghi vào audit log JSONL.
+
 ### Bảo mật dữ liệu (đã kiểm)
 - `.env` trong `.gitignore`, `.dockerignore` loại `.env` khỏi image — secret không lọt.
 - Mọi API key đọc từ ENV, KHÔNG hardcode, KHÔNG log ra token/nội dung nhạy cảm.

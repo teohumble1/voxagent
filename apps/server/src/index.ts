@@ -7,10 +7,13 @@ import {
   type Agent,
 } from "@voxagent/agent-core";
 import { checkAuth, RateLimiter } from "./security.js";
+import { evaluateWithAgentGuard } from "./guardGateway.js";
 import { createVoiceGateway, DeepgramStt, ElevenLabsTts } from "@voxagent/voice";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const API_TOKEN = process.env.VOXAGENT_API_TOKEN; // bật auth khi có
+// Sidecar agent-guard (Python) — lớp phòng thủ thứ hai, bật khi đặt URL.
+const AGENT_GUARD_URL = process.env.AGENT_GUARD_URL;
 const MAX_BODY = 16 * 1024; // 16KB: chống payload lớn
 const SESSION_TTL_MS = 30 * 60_000;
 const MAX_SESSIONS = 1000;
@@ -116,6 +119,17 @@ async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<vo
   const controller = new AbortController();
   req.on("close", () => controller.abort());
 
+  // Lớp 1: agent-guard sidecar (nếu bật) — chặn trước khi chạm vào agent.
+  if (AGENT_GUARD_URL) {
+    const verdict = await evaluateWithAgentGuard(AGENT_GUARD_URL, message, "voxagent-server");
+    if (verdict.decision !== "allow") {
+      const rules = verdict.ruleIds.length ? ` [${verdict.ruleIds.join(", ")}]` : "";
+      send("blocked", { message: `agent-guard: ${verdict.reason}${rules}` });
+      res.end();
+      return;
+    }
+  }
+
   try {
     const conv = getConversation(sessionId);
     const stream = agent.chatStream(conv, message, { signal: controller.signal });
@@ -147,6 +161,7 @@ const server = createServer((req, res) => {
       auth: Boolean(API_TOKEN),
       hasAnthropic: hasKey("anthropic"),
       hasOpenAI: hasKey("openai"),
+      agentGuard: Boolean(AGENT_GUARD_URL),
       sessions: sessions.size,
     });
     return;
@@ -178,5 +193,6 @@ server.listen(PORT, () => {
   console.log(`🚀 VoxAgent server: http://localhost:${PORT}`);
   console.log(`   auth: ${API_TOKEN ? "BẬT (Bearer token)" : "TẮT (dev — đặt VOXAGENT_API_TOKEN để bật)"}`);
   console.log(`   rate limit: 30 req/phút/IP · body max 16KB · session TTL 30 phút`);
+  console.log(`   agent-guard sidecar: ${AGENT_GUARD_URL ? `BẬT (${AGENT_GUARD_URL}, fail-closed)` : "TẮT (đặt AGENT_GUARD_URL để bật)"}`);
   console.log(`   voice (WS /voice): ${voiceOn ? "BẬT" : "TẮT (cần DEEPGRAM_API_KEY + ELEVENLABS_API_KEY)"}`);
 });
