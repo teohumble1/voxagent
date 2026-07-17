@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VoxAgent — Demo thoại real-time (WebSocket)</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 560px; margin: 48px auto; padding: 0 20px; }
+      button { font-size: 16px; padding: 10px 18px; border-radius: 8px; border: 1px solid #4f46e5; background: #4f46e5; color: #fff; cursor: pointer; }
+      #log { margin-top: 20px; font-size: 14px; white-space: pre-wrap; background: #f5f5f7; padding: 12px; border-radius: 8px; min-height: 120px; }
+      .state { font-weight: 600; color: #4f46e5; }
+    </style>
+  </head>
+  <body>
+    <h1>VoxAgent — Thoại real-time</h1>
+    <p>Cần server chạy voice (WS <code>/voice</code>) với DEEPGRAM_API_KEY + ELEVENLABS_API_KEY.</p>
+    <button id="btn">🎤 Bắt đầu nói</button>
+    <div>Trạng thái: <span id="state" class="state">idle</span></div>
+    <div id="log"></div>
+
+    <script>
+      const SERVER = "ws://localhost:8787/voice";
+      const SR = 16000; // sample rate gửi lên (khớp Deepgram linear16 16k)
+      const logEl = document.getElementById("log");
+      const stateEl = document.getElementById("state");
+      const btn = document.getElementById("btn");
+      const log = (m) => (logEl.textContent += m + "\n");
+
+      let ws, audioCtx, source, processor, playCtx, playTime = 0;
+      let silenceFrames = 0, speaking = false, running = false;
+
+      function toPCM16(float32, inRate) {
+        // downsample tuyến tính về SR rồi chuyển Int16
+        const ratio = inRate / SR;
+        const outLen = Math.floor(float32.length / ratio);
+        const out = new Int16Array(outLen);
+        for (let i = 0; i < outLen; i++) {
+          const s = float32[Math.floor(i * ratio)] || 0;
+          out[i] = Math.max(-32768, Math.min(32767, s * 32767));
+        }
+        return out;
+      }
+
+      function playPCM16(buf) {
+        const int16 = new Int16Array(buf);
+        const f32 = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32767;
+        const audioBuf = playCtx.createBuffer(1, f32.length, SR);
+        audioBuf.getChannelData(0).set(f32);
+        const src = playCtx.createBufferSource();
+        src.buffer = audioBuf;
+        src.connect(playCtx.destination);
+        const now = playCtx.currentTime;
+        playTime = Math.max(playTime, now);
+        src.start(playTime);
+        playTime += audioBuf.duration;
+      }
+
+      async function start() {
+        running = true;
+        btn.textContent = "⏹ Dừng";
+        playCtx = new AudioContext({ sampleRate: SR });
+        ws = new WebSocket(SERVER);
+        ws.binaryType = "arraybuffer";
+        ws.onmessage = (e) => {
+          if (typeof e.data !== "string") { playPCM16(e.data); return; }
+          const ev = JSON.parse(e.data);
+          if (ev.type === "state") stateEl.textContent = ev.state;
+          else if (ev.type === "partial-transcript") stateEl.textContent = "nghe: " + ev.text;
+          else if (ev.type === "final-transcript") log("🧑 " + ev.text);
+          else if (ev.type === "agent-text") logEl.textContent += ev.delta;
+          else if (ev.type === "turn-latency") log("\n⏱ latency " + ev.ms + "ms");
+          else if (ev.type === "barge-in") log("✋ (ngắt lời)");
+        };
+
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioCtx = new AudioContext();
+        source = audioCtx.createMediaStreamSource(stream);
+        processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        source.connect(processor);
+        processor.connect(audioCtx.destination);
+        processor.onaudioprocess = (ev) => {
+          if (!running || ws.readyState !== 1) return;
+          const input = ev.inputBuffer.getChannelData(0);
+          // VAD năng lượng đơn giản
+          let energy = 0;
+          for (let i = 0; i < input.length; i++) energy += input[i] * input[i];
+          energy = Math.sqrt(energy / input.length);
+          if (energy > 0.015) { speaking = true; silenceFrames = 0; ws.send(toPCM16(input, audioCtx.sampleRate).buffer); }
+          else if (speaking) {
+            silenceFrames++;
+            if (silenceFrames > 6) { speaking = false; ws.send(JSON.stringify({ type: "speech_end" })); }
+          }
+        };
+      }
+
+      function stop() {
+        running = false;
+        btn.textContent = "🎤 Bắt đầu nói";
+        processor && processor.disconnect();
+        source && source.disconnect();
+        audioCtx && audioCtx.close();
+        ws && ws.close();
+      }
+
+      btn.onclick = () => (running ? stop() : start().catch((e) => log("Lỗi: " + e.message)));
+    </script>
+  </body>
+</html>

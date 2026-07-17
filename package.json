@@ -1,0 +1,19 @@
+{
+  "name": "voxagent",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Real-time Voice AI Agent Platform — capstone project",
+  "type": "module",
+  "scripts": {
+    "typecheck": "pnpm -r typecheck",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "cli": "pnpm --filter @voxagent/cli dev"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.1"
+  }
+}

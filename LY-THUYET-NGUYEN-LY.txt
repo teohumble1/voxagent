@@ -1,0 +1,306 @@
+================================================================================
+  VOXAGENT — LÝ THUYẾT & NGUYÊN LÝ (tài liệu tự học)
+  Dành cho: kỹ sư giỏi C++/systems/security, mới sang Node/TS + LLM/Voice
+  Mục tiêu: hiểu BẢN CHẤT 6 nhóm skill trong JD AI Engineer (Voice Agents)
+================================================================================
+
+Đọc kèm code: mỗi mục có trỏ tới file cụ thể trong repo. Học lý thuyết xong thì
+mở file đó đọc — sẽ thấy "à, cái này chính là thứ vừa đọc".
+
+
+================================================================================
+PHẦN 0 — BẢN ĐỒ KIẾN TRÚC (đọc trước để có khung)
+================================================================================
+
+Toàn hệ thống là một MONOREPO (nhiều package trong một repo, chia sẻ config):
+
+  packages/agent-core   <- "não": gọi LLM, tool calling, fallback, guard, cache, telemetry
+  packages/voice        <- pipeline thoại real-time: turn-taking, barge-in
+  packages/mcp          <- MCP server/client + điều khiển trình duyệt
+  apps/cli              <- gõ lệnh thử agent nhanh
+  apps/server           <- phơi agent ra HTTP (SSE streaming) cho web
+  apps/widget           <- React widget nhúng vào web bất kỳ
+
+Luồng dữ liệu điển hình (voice):
+  Mic -> STT -> [VoiceSession quyết định hết lượt] -> agent-core (LLM+tool)
+      -> text -> TTS -> Loa.  Người dùng nói chen ngang -> barge-in -> huỷ hết.
+
+Luồng text (widget):
+  Trình duyệt -> POST /chat -> server -> agent-core.stream() -> SSE token
+      -> widget hiển thị dần.
+
+Nguyên tắc thiết kế xuyên suốt: TÁCH INTERFACE KHỎI IMPLEMENTATION.
+Mọi thứ "cắm ngoài" (LLM provider, STT, TTS, browser, cache, transport) đều là
+một interface + bản mock để test + bản thật để chạy. Đây là lý do test chạy được
+mà KHÔNG cần API key.
+
+
+================================================================================
+PHẦN 1 — NODE.JS + TYPESCRIPT (nhóm #1)  [file: mọi *.ts, tsconfig.base.json]
+================================================================================
+
+1.1. NODE = JavaScript chạy ngoài trình duyệt, MỘT luồng + EVENT LOOP.
+  - Khác C++ (nhiều thread + blocking): Node chỉ 1 thread chính. Muốn không "đơ"
+    khi chờ I/O (mạng, file, LLM), ta KHÔNG chặn luồng mà đăng ký callback rồi
+    để event loop chạy tiếp việc khác, xong I/O thì quay lại.
+  - Hệ quả: code I/O-nặng (như gọi LLM) rất hợp Node; code CPU-nặng thì không.
+
+1.2. ASYNC / AWAIT = đường ngọt cho Promise.
+  - Promise = "một giá trị sẽ có trong tương lai" (giống std::future).
+  - `await p` = tạm nhả luồng cho tới khi p xong, KHÔNG chặn thread.
+  - `async function` luôn trả về Promise.
+  - AsyncGenerator (`async function*` + `yield`) = luồng giá trị bất đồng bộ —
+    ta dùng nó cho STREAMING token LLM: mỗi `yield` là một mẩu chữ về tới.
+    (xem agent.ts: stream() dùng `for await ... of`)
+
+1.3. TYPESCRIPT = JavaScript + hệ kiểu tĩnh, kiểm tra lúc COMPILE.
+  - Type bị "xoá" khi chạy (type erasure) — runtime vẫn là JS thuần.
+  - `strict: true` bật hết kiểm tra nghiêm. Repo còn bật:
+      noUncheckedIndexedAccess -> arr[i] có kiểu T | undefined (ép bạn xử lý biên)
+      verbatimModuleSyntax     -> phải `import type` cho type (rõ ràng ESM)
+  - Vì sao dân production mê TS: refactor an tâm, IDE gợi ý đúng, bug lộ sớm.
+
+1.4. ESM vs CommonJS.
+  - ESM (import/export) là chuẩn hiện đại; repo dùng "type":"module".
+  - Chi tiết dễ vấp: trong ESM + NodeNext, import file nội bộ phải ghi ĐUÔI .js
+    dù bạn viết .ts (vì đường dẫn tính theo output). Thấy `from "./agent.js"` là vậy.
+
+1.5. MONOREPO + pnpm workspace.
+  - Nhiều package nói chuyện nhau qua "workspace:*" (link nội bộ, không tải mạng).
+  - pnpm "strict": không cho import package mà bạn chưa khai báo là dependency
+    (chống "phantom dependency"). Đó là lý do phải `pnpm add` sdk-trace-base dù nó
+    là dep gián tiếp — ta có dùng trực tiếp thì phải khai trực tiếp.
+
+
+================================================================================
+PHẦN 2 — LLM / AGENTS (nhóm #2, lõi)   [file: agent-core/src/*]
+================================================================================
+
+2.1. LLM CƠ BẢN: mô hình đoán token kế tiếp. Ta gửi "messages" (system + user),
+     model trả text. Không có trí nhớ giữa các lần gọi — muốn nhớ phải tự gửi lại
+     lịch sử.
+
+2.2. TOOL CALLING (function calling) — nguyên lý QUAN TRỌNG NHẤT của agent.
+  - Ta mô tả cho model một danh sách "tool": tên + mô tả + schema tham số.
+  - Model KHÔNG tự chạy tool. Nó chỉ TRẢ VỀ ý định: "hãy gọi getCurrentTime với
+    {timezone:'Asia/Ho_Chi_Minh'}". Runtime (code của ta) mới thực sự chạy hàm,
+    rồi ĐƯA KẾT QUẢ ngược lại model, model đọc kết quả và trả lời tiếp.
+  - Vòng lặp này lặp nhiều "bước" (steps) tới khi model không đòi gọi tool nữa.
+    Trong AI SDK: `stopWhen: stepCountIs(n)` giới hạn số bước (chống lặp vô tận).
+  - Vì sao mạnh: LLM lo NGÔN NGỮ + QUYẾT ĐỊNH, còn tool lo DỮ LIỆU CHÍNH XÁC
+    (giờ, tính toán, tra DB, gọi API). Model hết "chém gió" số liệu.
+  - (xem tools.ts: mỗi tool = description + inputSchema(Zod) + execute)
+
+2.3. STRUCTURED OUTPUT — ép model trả về ĐÚNG SCHEMA, không phải văn tự do.
+  - Dùng khi cần dữ liệu máy đọc được (JSON theo Zod schema). Model bị buộc điền
+    đúng field. (xem agent.ts: extractStructured + generateObject)
+  - Zod = thư viện mô tả "hình dạng" dữ liệu + validate runtime; đồng thời sinh ra
+    kiểu TS. Một nguồn sự thật cho cả validate lẫn type.
+
+2.4. STREAMING — trả chữ dần thay vì chờ xong hết.
+  - Trải nghiệm: người dùng thấy chữ chạy ngay (như ChatGPT). Với voice thì BẮT
+    BUỘC vì phải nói câu đầu sớm. streamText -> textStream (AsyncIterable).
+
+2.5. MULTI-AGENT (nhiều agent phối hợp).
+  - Pattern dùng ở đây: "AGENT-AS-TOOL". Một orchestrator (điều phối) coi mỗi
+    agent chuyên môn như một tool. Nó chia nhỏ yêu cầu, "gọi" chuyên gia thời gian,
+    chuyên gia toán... rồi tổng hợp. (xem orchestrator.ts)
+  - Vì sao chia: mỗi agent có system prompt + bộ tool hẹp -> ít lỗi, dễ kiểm soát,
+    dễ debug hơn một agent "biết tuốt".
+
+2.6. MULTI-PROVIDER + FALLBACK — chống phụ thuộc một nhà cung cấp.
+  - Ta viết code KHÔNG khoá cứng OpenAI hay Anthropic; provider là biến.
+  - Fallback runtime: gọi provider ưu tiên, LỖI (rate limit/5xx) thì tự thử
+    provider kia. (xem fallback.ts: withFallback)
+  - Tinh tế ở STREAMING: chỉ fallback được nếu CHƯA phát token nào; đã phát rồi
+    mà đổi provider sẽ ra output trùng/lộn xộn -> nên khi đó ném lỗi.
+    (xem fallback.ts: streamWithFallback + biến `emitted`)
+
+
+================================================================================
+PHẦN 3 — VOICE REAL-TIME (nhóm #3, khó nhất)   [file: voice/src/*]
+================================================================================
+
+3.1. PIPELINE: Audio -> STT -> Agent -> TTS -> Audio.
+  - STT (Speech-to-Text): tiếng nói -> chữ, kiểu STREAMING (trả "partial" khi bạn
+    đang nói, "final" khi chốt câu). VD: Deepgram, OpenAI Realtime, Whisper.
+  - TTS (Text-to-Speech): chữ -> tiếng, cũng streaming (phát audio dần). VD:
+    ElevenLabs, Cartesia. BẮT BUỘC hỗ trợ HUỶ (cho barge-in).
+  - (interface: voice/src/types.ts — SttProvider, TtsProvider)
+
+3.2. VAD (Voice Activity Detection) — phát hiện có tiếng nói hay im lặng.
+  - Dùng để biết KHI NÀO người dùng bắt đầu/ngừng nói.
+
+3.3. TURN-TAKING (luân phiên lượt) — bài toán "khi nào tới lượt máy nói".
+  - Đơn giản nhất: sau khi người dùng im lặng đủ lâu (vd 500-800ms) -> coi là hết
+    lượt -> cho agent xử lý. (Ngưỡng quá ngắn: cắt lời; quá dài: máy phản hồi chậm.)
+  - MỤC TIÊU JD "<1s": tính từ lúc người dùng ngừng nói tới lúc NGHE THẤY tiếng
+    đầu tiên của máy. Đây là "độ trễ cảm nhận".
+  - (xem session.ts: endTurn() ghi mốc thời gian; sự kiện "turn-latency")
+
+3.4. GIẢM LATENCY bằng SENTENCE CHUNKING — mẹo quan trọng.
+  - Đừng chờ LLM sinh XONG cả đoạn rồi mới đọc. Ngay khi có DẤU KẾT CÂU đầu tiên
+    (. ! ?), đẩy câu đó sang TTS đọc luôn, trong khi LLM vẫn sinh tiếp câu sau.
+  - Kết quả: người dùng nghe câu đầu sớm hơn nhiều. (xem chunk.ts: SentenceChunker)
+
+3.5. BARGE-IN (nói chen ngang) — dấu hiệu voice agent "xịn".
+  - Người thật khi nghe máy nói mà muốn ngắt, họ nói chen vào. Máy phải: DỪNG NGAY
+    tiếng đang phát + HUỶ agent đang chạy + quay lại lắng nghe.
+  - Cơ chế: một AbortController cho mỗi lượt. Barge-in gọi abort() -> streamText
+    dừng, TTS dừng. Thêm biến `turnSeq` (số thứ tự lượt) để LỜ ĐI mọi kết quả
+    "trễ" của lượt cũ vừa bị huỷ. (xem session.ts: bargeIn(), turnSeq)
+
+3.6. MÁY TRẠNG THÁI (state machine): idle -> listening -> thinking -> speaking.
+  - Vì sao dùng state machine: hội thoại có luật chuyển trạng thái rõ ràng; viết
+    tường minh giúp không rơi vào trạng thái "lửng lơ" (vd kẹt ở speaking mãi).
+
+3.7. WEBRTC (transport âm thanh giữa trình duyệt và server).
+  - WebRTC = chuẩn truyền audio/video P2P độ trễ thấp, có sẵn trong trình duyệt.
+    Phức tạp (SDP, ICE, DTLS-SRTP) nên trong repo ta để nó là "tầng transport"
+    tách rời: VoiceSession chỉ nhận sự kiện speechStart/transcript/endTurn, nên
+    cắm WebRTC hay WebSocket vào đều được. Nguyên lý: cô lập phần khó vào một seam.
+
+
+================================================================================
+PHẦN 4 — MCP + BROWSER (nhóm #4)   [file: mcp/src/*]
+================================================================================
+
+4.1. MCP (Model Context Protocol) — "cổng USB cho công cụ của AI".
+  - Vấn đề: mỗi app AI tự định nghĩa tool theo kiểu riêng -> không tái dùng được.
+  - MCP là CHUẨN CHUNG: một "MCP server" phơi ra tool/resource; bất kỳ "MCP client"
+    nào (Claude Desktop, IDE, agent của bạn) cũng gọi được cùng bộ tool đó.
+  - Kiến trúc: client <-> server nói chuyện qua JSON-RPC trên một "transport"
+    (stdio = server chạy như tiến trình con; hoặc in-memory để test).
+
+4.2. HAI VAI:
+  - SERVER: đăng ký tool (registerTool: tên + mô tả + inputSchema + hàm chạy).
+    (xem server.ts: 4 tool browser_navigate/extract_text/links/click)
+  - CLIENT: connect -> listTools() -> callTool(). (xem client.ts)
+
+4.3. ADAPTER MCP -> AI SDK (cây cầu).
+  - Tool của MCP mô tả tham số bằng JSON Schema; AI SDK cần tool có inputSchema.
+  - Ta viết adapter: lấy JSON Schema của MCP bọc bằng jsonSchema() của AI SDK, còn
+    execute thì uỷ thác về client.callTool(). Nhờ vậy agent gọi tool MCP y hệt tool
+    nội bộ. (xem client.ts: mcpToolSet)
+
+4.4. AGENTIC BROWSER AUTOMATION — agent tự lướt web để hoàn thành việc.
+  - Ta phơi các HÀNH ĐỘNG trình duyệt thành tool (mở URL, đọc text, liệt kê link,
+    click). Agent gọi tuần tự: navigate -> extract -> click -> ... như người dùng.
+  - Interface BrowserController tách khỏi cách chạy: MockBrowser (web giả trong bộ
+    nhớ, để test) / FetchBrowser (fetch thật). Trang cần JS -> thay bằng Playwright
+    (điều khiển Chromium thật) cùng interface. (xem browser.ts)
+  - InMemoryTransport cho phép nhúng server ngay trong tiến trình -> test round-trip
+    client<->server không cần spawn process. (xem client.ts: embedMcpServer)
+
+
+================================================================================
+PHẦN 5 — FRONTEND (nhóm #5)   [file: apps/server/*, apps/widget/*]
+================================================================================
+
+5.1. SSE (Server-Sent Events) — kênh 1 chiều server -> client, đơn giản hơn WebSocket.
+  - Server giữ kết nối HTTP mở, đẩy từng dòng "event:.../data:...". Hợp streaming
+    token LLM. (xem server/src/index.ts: handleChat)
+  - Client đọc bằng fetch + ReadableStream, tự cắt frame theo "\n\n".
+    (xem widget/src/sse.ts)
+  - Barge-in ở web: client đóng tab -> server bắt sự kiện 'close' -> AbortController
+    huỷ agent (khỏi tốn tiền LLM cho câu trả lời không ai đọc).
+
+5.2. REACT — thư viện UI theo mô hình "state -> giao diện".
+  - Bạn mô tả UI theo state; state đổi thì React vẽ lại phần cần thiết.
+  - useState (giữ state), useRef (giữ tham chiếu không gây vẽ lại, vd để cuộn),
+    useCallback (giữ nguyên hàm giữa các lần render). (xem widget/src/Widget.tsx)
+
+5.3. EMBEDDABLE WIDGET — nhúng vào web BẤT KỲ.
+  - Build "library mode" (Vite): gói luôn React vào -> ra 1 file JS TỰ CHỨA.
+  - Chủ web chỉ cần <script src> + VoxAgentWidget.mount({endpoint}). Không đụng
+    build của họ. (xem widget/src/mount.tsx + demo.html)
+
+5.4. ADVANCED TS ở frontend:
+  - DISCRIMINATED UNION: ChatEvent = {type:"token"} | {type:"done"} | ...
+    Nhờ trường `type`, khi bạn `switch(ev.type)` thì TS TỰ THU HẸP kiểu trong từng
+    nhánh (trong case "token" thì chắc chắn có ev.text). Cực an toàn, hết đoán mò.
+    (xem sse.ts)
+
+
+================================================================================
+PHẦN 6 — PRODUCTION (nhóm #6, điểm cộng — sân nhà security của bạn)
+================================================================================                                     [file: agent-core: telemetry.ts, cache.ts, guard.ts]
+
+6.1. OBSERVABILITY (quan sát hệ thống chạy) qua OPENTELEMETRY.
+  - OTel = chuẩn chung để phát "span" (một đoạn việc: bắt đầu, kết thúc, thuộc tính).
+    Nhiều span nối nhau thành "trace" (dấu vết một request đi qua hệ thống).
+  - AI SDK tự phát span cho mỗi lời gọi model nếu ta bật experimental_telemetry.
+    Ta chỉ cần dựng một "TracerProvider" + nơi xuất span. (xem telemetry.ts)
+  - LANGFUSE = công cụ chuyên xem trace của LLM app (prompt, token, chi phí, latency).
+    Nó nhận dữ liệu qua chính chuẩn OTel -> chỉ cần đặt endpoint + key, KHÔNG đổi code.
+
+6.2. CACHING (bộ nhớ đệm).
+  - Lưu kết quả để lần sau khỏi gọi lại (tiết kiệm tiền + nhanh). Key = băm của
+    (system + prompt + danh sách tool). (xem cache.ts)
+  - LRU (Least Recently Used): đầy thì bỏ phần tử lâu chưa dùng nhất.
+  - QUAN TRỌNG: chỉ cache prompt "idempotent" (hỏi gì cũng ra kết quả như nhau).
+    Hỏi "mấy giờ rồi" mà cache là SAI. Vì thế cache để OPT-IN, mặc định tắt.
+  - Phân biệt với "prompt caching" của Anthropic: đó là cache Ở PHÍA MODEL phần
+    prefix prompt để rẻ hơn — khác với response cache của app ta.
+
+6.3. PROMPT-INJECTION DEFENSE (phòng thủ tiêm lệnh) — phần security bạn mạnh.
+  - MỐI ĐE DOẠ: người dùng (hoặc nội dung web mà tool kéo về) chèn lệnh nhằm ép
+    model bỏ qua chỉ dẫn, lộ system prompt, hay lạm dụng tool. LLM không phân biệt
+    rạch ròi "dữ liệu" và "lệnh" như CPU phân biệt data/code -> đây là lỗ hổng lớp mới.
+  - PHÒNG THỦ NHIỀU LỚP (defense-in-depth — đúng tư duy an ninh):
+     Lớp 1 - Soi INPUT: bắt mẫu injection ("ignore previous instructions", "reveal
+             system prompt", jailbreak, delimiter <|im_start|>, exfiltration...),
+             chấm rủi ro low/med/high, chặn high. (guard.ts: inspectInput)
+     Lớp 2 - TOOL ALLOWLIST: dù model có bị dụ gọi tool nguy hiểm, tầng execute
+             vẫn từ chối nếu tool không nằm trong danh sách cho phép. (guardTools)
+     Lớp 3 - Lọc OUTPUT: nếu phản hồi lỡ chứa nguyên văn system prompt -> che đi.
+             (sanitizeOutput)
+  - Không lớp nào hoàn hảo (như IDS/IPS): mục tiêu là NHIỀU LỚP + ghi log, giảm
+    xác suất và bề mặt tấn công. Đây chính là lợi thế của bạn so với ứng viên thường.
+
+
+================================================================================
+PHẦN 7 — CÂU HỎI PHỎNG VẤN HAY GẶP (tự trả lời được là nắm chắc)
+================================================================================
+
+1) Tool calling hoạt động thế nào? Model có tự chạy tool không?
+   -> Không. Model chỉ ĐỀ XUẤT gọi tool + tham số; runtime chạy rồi trả kết quả
+      lại cho model. Lặp qua nhiều "step".
+
+2) Làm sao giữ turn-taking < 1s?
+   -> Đo từ lúc người dùng ngừng nói tới token TTS đầu. Giảm bằng: STT/TTS streaming,
+      sentence-chunking (đọc câu đầu sớm), model nhanh, hạ tầng gần.
+
+3) Barge-in cài thế nào cho đúng?
+   -> AbortController huỷ agent + TTS ngay khi phát hiện tiếng nói chen vào; dùng
+      số thứ tự lượt để bỏ mọi kết quả trễ của lượt cũ.
+
+4) Vì sao fallback streaming khó hơn non-streaming?
+   -> Đã phát token thì đổi provider sẽ trùng/lộn output; chỉ fallback khi chưa
+      phát mẩu nào.
+
+5) MCP giải quyết vấn đề gì?
+   -> Chuẩn hoá cách phơi tool cho AI, để tool tái dùng được across nhiều client.
+
+6) Chống prompt injection ra sao?
+   -> Nhiều lớp: soi input, allowlist tool ở tầng thực thi, lọc output; kèm log.
+      Nhấn mạnh: LLM không tách bạch data/instruction -> phải phòng thủ chủ động.
+
+7) Structured output khác prompt "trả JSON giúp tôi" chỗ nào?
+   -> Structured output RÀNG BUỘC bằng schema (Zod/JSON Schema) + validate, không
+      phụ thuộc model "ngoan"; ổn định hơn nhiều cho production.
+
+
+================================================================================
+GỢI Ý LỘ TRÌNH ÔN
+================================================================================
+- Ngày 1-2: Phần 1 + 2, mở agent-core đọc từng file, chạy `pnpm cli`.
+- Ngày 3-4: Phần 3, đọc session.ts, tự vẽ lại state machine ra giấy.
+- Ngày 5:   Phần 4, chạy thử MCP (đọc client.ts/server.ts).
+- Ngày 6:   Phần 5, dựng server + mở demo.html.
+- Ngày 7:   Phần 6 + Phần 7, luyện trả lời miệng các câu phỏng vấn.
+
+Nhớ: bạn ĐÃ có nền systems/security rất mạnh (kernel driver, YARA, local LLM ở
+avsuite). Thứ mới chỉ là hệ sinh thái web + agent tooling. Nắm nguyên lý ở trên
+là đủ tự tin phỏng vấn vị trí này.
+================================================================================

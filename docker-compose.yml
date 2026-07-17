@@ -1,0 +1,24 @@
+services:
+  server:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      PORT: "8787"
+      # Secret đọc từ file .env của host lúc chạy (KHÔNG commit .env).
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      VOXAGENT_API_TOKEN: ${VOXAGENT_API_TOKEN:-}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: unless-stopped

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VoxAgent Widget — Demo nhúng</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; color: #222; }
+      code { background: #f0f0f3; padding: 2px 6px; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>Trang web bất kỳ</h1>
+    <p>
+      Widget VoxAgent được nhúng chỉ bằng một thẻ <code>&lt;script&gt;</code> + một lời gọi
+      <code>mount()</code>. Bong bóng 💬 xuất hiện ở góc phải dưới.
+    </p>
+    <p>Cần chạy <code>@voxagent/server</code> ở <code>http://localhost:8787</code> trước.</p>
+
+    <!-- 1) Bundle tự chứa (đã gói sẵn React) -->
+    <script src="./dist/voxagent-widget.js"></script>
+    <!-- 2) Khởi tạo -->
+    <script>
+      window.VoxAgentWidget.mount({
+        endpoint: "http://localhost:8787",
+        title: "Trợ lý VoxAgent",
+        accent: "#4f46e5",
+      });
+    </script>
+  </body>
+</html>
