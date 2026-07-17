@@ -27,11 +27,13 @@ jobs:
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
 
+      # Build trước: apps/cli resolve @voxagent/agent-core qua dist/,
+      # typecheck sẽ fail nếu chưa build (pnpm -r build chạy đúng thứ tự deps).
+      - name: Build
+        run: pnpm -r build
+
       - name: Typecheck
         run: pnpm -r typecheck
 
       - name: Test
         run: pnpm -r test
-
-      - name: Build
-        run: pnpm -r build
