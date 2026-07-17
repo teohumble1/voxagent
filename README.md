@@ -153,6 +153,11 @@ Sau 6 phase nền, dự án được nâng lên mức production:
   streaming, huỷ được), **WS voice gateway** wiring VoiceSession — test e2e qua ws
   bằng mock. Browser client: `apps/widget/voice-demo.html` (mic → PCM16 → WS → phát).
   Bật khi có `DEEPGRAM_API_KEY` + `ELEVENLABS_API_KEY`.
+- **Voice LOCAL (không cần key)**: `WhisperStt` (whisper.cpp, batch theo lượt nói
+  qua seam `flush()` mới của `SttProvider`) + `PiperTts` (giọng tiếng Việt
+  vi_VN-vais1000, `--output-raw` + resample 22050→16k, kill process khi barge-in).
+  Cấu hình 4 env `WHISPER_BIN/WHISPER_MODEL/PIPER_BIN/PIPER_MODEL` (xem
+  .env.example); kết hợp Ollama là **cả stack voice-agent chạy 100% trên máy**.
 - **Playwright browser thật**: `PlaywrightBrowser` (Chromium headless) cùng interface
   `BrowserController`. Hỗ trợ `executablePath`/`channel`/`CHROME_PATH` để trỏ Chrome
   tự cài (CDN Playwright bị chặn theo vùng ở đây — dùng escape hatch này).

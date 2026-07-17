@@ -20,6 +20,12 @@ export interface SttProvider {
   start(onTranscript: (t: Transcript) => void): void;
   pushAudio(chunk: AudioChunk): void;
   stop(): void;
+  /**
+   * (Tuỳ chọn) Provider dạng batch (vd Whisper local) transcribe phần audio đã
+   * gom khi được gọi. Gateway await flush() TRƯỚC session.endTurn() để final
+   * transcript kịp có mặt. Provider streaming (Deepgram) không cần implement.
+   */
+  flush?(): Promise<void>;
 }
 
 /**

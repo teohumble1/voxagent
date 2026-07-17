@@ -52,7 +52,12 @@ export function createVoiceGateway(opts: VoiceGatewayOptions): WebSocketServer {
       }
       try {
         const msg = JSON.parse(data.toString()) as { type?: string };
-        if (msg.type === "speech_end") session.endTurn();
+        if (msg.type === "speech_end") {
+          // STT batch (Whisper local) cần flush xong mới có final transcript.
+          void Promise.resolve(stt.flush?.())
+            .catch(() => undefined)
+            .then(() => session.endTurn());
+        }
       } catch {
         /* bỏ qua control message hỏng */
       }

@@ -8,7 +8,13 @@ import {
 } from "@voxagent/agent-core";
 import { checkAuth, RateLimiter } from "./security.js";
 import { evaluateWithAgentGuard } from "./guardGateway.js";
-import { createVoiceGateway, DeepgramStt, ElevenLabsTts } from "@voxagent/voice";
+import {
+  createVoiceGateway,
+  DeepgramStt,
+  ElevenLabsTts,
+  PiperTts,
+  WhisperStt,
+} from "@voxagent/voice";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const API_TOKEN = process.env.VOXAGENT_API_TOKEN; // bật auth khi có
@@ -173,19 +179,43 @@ const server = createServer((req, res) => {
   json(res, 404, { error: "Not found" });
 });
 
-// Voice real-time (WS /voice) chỉ bật khi có đủ key STT + TTS — an toàn khi thiếu.
+// Voice real-time (WS /voice) — 2 chế độ:
+//  - local: whisper.cpp + Piper (không cần mạng/key) khi đủ 4 env WHISPER_*/PIPER_*
+//  - cloud: Deepgram + ElevenLabs khi có đủ 2 API key
+// VOICE_PROVIDER=local|cloud ép chọn; mặc định ưu tiên local nếu cấu hình đủ.
 const DEEPGRAM = process.env.DEEPGRAM_API_KEY;
 const ELEVENLABS = process.env.ELEVENLABS_API_KEY;
-function maybeStartVoice(): boolean {
-  if (!DEEPGRAM || !ELEVENLABS) return false;
+const WHISPER_BIN = process.env.WHISPER_BIN;
+const WHISPER_MODEL = process.env.WHISPER_MODEL;
+const PIPER_BIN = process.env.PIPER_BIN;
+const PIPER_MODEL = process.env.PIPER_MODEL;
+
+function maybeStartVoice(): "local" | "cloud" | false {
+  const hasLocal = Boolean(WHISPER_BIN && WHISPER_MODEL && PIPER_BIN && PIPER_MODEL);
+  const hasCloud = Boolean(DEEPGRAM && ELEVENLABS);
+  const forced = process.env.VOICE_PROVIDER;
+  const mode =
+    forced === "local" ? (hasLocal ? "local" : false)
+    : forced === "cloud" ? (hasCloud ? "cloud" : false)
+    : hasLocal ? "local"
+    : hasCloud ? "cloud"
+    : false;
+  if (!mode) return false;
+
   createVoiceGateway({
     server,
     path: "/voice",
     agent,
-    createStt: () => new DeepgramStt(DEEPGRAM, { language: "vi" }),
-    tts: new ElevenLabsTts(ELEVENLABS),
+    createStt: () =>
+      mode === "local"
+        ? new WhisperStt({ binPath: WHISPER_BIN!, modelPath: WHISPER_MODEL!, language: "vi" })
+        : new DeepgramStt(DEEPGRAM!, { language: "vi" }),
+    tts:
+      mode === "local"
+        ? new PiperTts({ binPath: PIPER_BIN!, modelPath: PIPER_MODEL! })
+        : new ElevenLabsTts(ELEVENLABS!),
   });
-  return true;
+  return mode;
 }
 
 server.listen(PORT, () => {
@@ -194,5 +224,5 @@ server.listen(PORT, () => {
   console.log(`   auth: ${API_TOKEN ? "BẬT (Bearer token)" : "TẮT (dev — đặt VOXAGENT_API_TOKEN để bật)"}`);
   console.log(`   rate limit: 30 req/phút/IP · body max 16KB · session TTL 30 phút`);
   console.log(`   agent-guard sidecar: ${AGENT_GUARD_URL ? `BẬT (${AGENT_GUARD_URL}, fail-closed)` : "TẮT (đặt AGENT_GUARD_URL để bật)"}`);
-  console.log(`   voice (WS /voice): ${voiceOn ? "BẬT" : "TẮT (cần DEEPGRAM_API_KEY + ELEVENLABS_API_KEY)"}`);
+  console.log(`   voice (WS /voice): ${voiceOn ? `BẬT (${voiceOn})` : "TẮT (cần WHISPER_*/PIPER_* cho local, hoặc DEEPGRAM+ELEVENLABS key cho cloud)"}`);
 });
